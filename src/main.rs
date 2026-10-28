@@ -2,6 +2,7 @@ mod abbrev;
 mod catalogue;
 mod commands;
 mod completion;
+mod import;
 mod kubeconfig;
 mod namespaces;
 mod paths;
@@ -52,6 +53,15 @@ enum Command {
         /// Also remove overlays holding entries kk didn't write (e.g. clusters added by other tools)
         #[arg(long)]
         force: bool,
+    },
+    /// Move entries other tools added to this shell's overlay into the main kubeconfig
+    Import {
+        /// Show what would be imported without changing anything
+        #[arg(long)]
+        dry_run: bool,
+        /// Replace differing entries in the main kubeconfig without asking
+        #[arg(long)]
+        overwrite: bool,
     },
     /// Return this shell to the plain main kubeconfig
     Exit {
@@ -132,6 +142,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
         Command::Namespace { namespace, refresh } => app.namespace(namespace, refresh),
         Command::Clean { force } => app.clean(force),
         Command::Exit { force } => app.exit(force),
+        Command::Import { dry_run, overwrite } => app.import(dry_run, overwrite),
         Command::Init { shell, aliases } => app.init(shell, aliases),
         Command::RefreshNamespaces { context } => app.refresh_namespaces(&context),
     }

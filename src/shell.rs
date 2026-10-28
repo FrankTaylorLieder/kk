@@ -100,6 +100,10 @@ pub struct ShellState {
     /// unset when switching away.
     #[serde(default)]
     pub env_keys: BTreeSet<String>,
+    /// The name of the context entry kk wrote into the overlay. Anything else in the
+    /// overlay was added by another tool.
+    #[serde(default)]
+    pub shadow: Option<String>,
 }
 
 impl ShellState {

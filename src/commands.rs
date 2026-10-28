@@ -1,12 +1,15 @@
 use std::fs;
+use std::io::IsTerminal;
+use std::path::Path;
 
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use chrono::{DateTime, Utc};
 
 use crate::abbrev::abbreviate;
 use crate::catalogue::{Catalogue, Key, Profile, Store};
+use crate::import::{self, Conflict, ImportReport};
 use crate::kubeconfig::{
-    ContextFields, KubeConfig, NamedContext, foreign_entries, read_overlay_current, write_overlay,
+    ContextFields, KubeConfig, NamedContext, foreign_entries, has_outside_changes, write_overlay,
 };
 use crate::namespaces;
 use crate::paths::Paths;
@@ -56,6 +59,7 @@ impl App {
 
     pub fn profile(&self, target: Option<String>) -> Result<()> {
         let mut shell = Shell::require()?;
+        self.reconcile(&mut shell, ImportMode::Auto)?;
         let key = match target.as_deref() {
             Some("-") => ShellState::load(&self.paths.state_file(shell.pid))?
                 .previous
@@ -181,7 +185,19 @@ impl App {
             }
             _ => key.derived_name(),
         };
-        println!("{name}");
+        // Flag a shell whose overlay another tool changed and kk hasn't picked up yet.
+        let marker = match self.active_overlay_pid() {
+            Some(pid) => {
+                let shadow = ShellState::load(&self.paths.state_file(pid))?.shadow;
+                if has_outside_changes(&self.paths.overlay_file(pid), shadow.as_deref())? {
+                    "!"
+                } else {
+                    ""
+                }
+            }
+            None => "",
+        };
+        println!("{name}{marker}");
         Ok(())
     }
 
@@ -193,6 +209,7 @@ impl App {
 
     pub fn context(&self, target: Option<String>) -> Result<()> {
         let mut shell = Shell::require()?;
+        self.reconcile(&mut shell, ImportMode::Auto)?;
         let main = self.main_config()?;
         if main.contexts.is_empty() {
             bail!("no contexts in {}", self.paths.main_kubeconfig.display());
@@ -235,6 +252,7 @@ impl App {
 
     pub fn namespace(&self, target: Option<String>, refresh: bool) -> Result<()> {
         let mut shell = Shell::require()?;
+        self.reconcile(&mut shell, ImportMode::Auto)?;
         let main = self.main_config()?;
         let current = self
             .current_key(Some(shell.pid), &main)?
@@ -258,7 +276,7 @@ impl App {
     }
 
     pub fn clean(&self, force: bool) -> Result<()> {
-        let cleanup = self.remove_dead_shell_files(force)?;
+        let cleanup = self.remove_dead_shell_files(force, auto_import_enabled())?;
         eprintln!("kk: removed {} stale file(s)", cleanup.removed);
         for (overlay, entries) in &cleanup.kept {
             eprintln!(
@@ -269,7 +287,7 @@ impl App {
         }
         if !cleanup.kept.is_empty() {
             eprintln!(
-                "kk: move those entries into {} (inspect with `kubectl --kubeconfig <overlay> config view --raw`), or run `kk clean --force` to discard them",
+                "kk: move those entries into {} (inspect with `kubectl --kubeconfig <overlay> config view --raw`, or import with `KUBECONFIG=<overlay> kk import`), or run `kk clean --force` to discard them",
                 self.paths.main_kubeconfig.display()
             );
         }
@@ -279,19 +297,21 @@ impl App {
     pub fn exit(&self, force: bool) -> Result<()> {
         let mut shell = Shell::require()?;
         let overlay = self.paths.overlay_file(shell.pid);
+        let state_file = self.paths.state_file(shell.pid);
         if !force {
-            let entries = foreign_entries(&overlay)?;
+            self.reconcile(&mut shell, ImportMode::Auto)?;
+            let shadow = ShellState::load(&state_file)?.shadow;
+            let entries = foreign_entries(&overlay, shadow.as_deref())?;
             if !entries.is_empty() {
                 bail!(
                     "not exiting: this shell's overlay holds {}, probably added by another tool, which would be lost.\n\
-                     Move them into {} (inspect with `kubectl --kubeconfig {} config view --raw`), or run `kk exit --force` to discard them",
+                     Move them into {} with `kk import` (or inspect with `kubectl --kubeconfig {} config view --raw`), or run `kk exit --force` to discard them",
                     entries.join(", "),
                     self.paths.main_kubeconfig.display(),
                     overlay.display()
                 );
             }
         }
-        let state_file = self.paths.state_file(shell.pid);
         let state = ShellState::load(&state_file)?;
         for name in &state.env_keys {
             shell.unset(name);
@@ -313,11 +333,190 @@ impl App {
         namespaces::fetch_and_cache(&self.paths, context).map(|_| ())
     }
 
+    pub fn import(&self, dry_run: bool, overwrite: bool) -> Result<()> {
+        let mut shell = Shell::require()?;
+        if self.overlay_key(shell.pid, &self.main_config()?)?.is_none() {
+            eprintln!("kk: this shell isn't using a kk overlay, so there's nothing to import");
+            return shell.finish();
+        }
+        let acted = self.reconcile(&mut shell, ImportMode::Explicit { dry_run, overwrite })?;
+        if !acted {
+            eprintln!("kk: nothing to import");
+        }
+        shell.finish()
+    }
+
+    /// Picks up changes other tools made to this shell's overlay: moves the entries
+    /// they added into the main config, and follows a `current-context` switch (as
+    /// `aws eks update-kubeconfig` makes). Returns whether there was anything to do.
+    fn reconcile(&self, shell: &mut Shell, mode: ImportMode) -> Result<bool> {
+        let (dry_run, overwrite) = match mode {
+            ImportMode::Auto if !auto_import_enabled() => return Ok(false),
+            ImportMode::Auto => (false, false),
+            ImportMode::Explicit { dry_run, overwrite } => (dry_run, overwrite),
+        };
+        let main = self.main_config()?;
+        if self.overlay_key(shell.pid, &main)?.is_none() {
+            return Ok(false);
+        }
+        let overlay = self.paths.overlay_file(shell.pid);
+        let shadow = ShellState::load(&self.paths.state_file(shell.pid))?.shadow;
+        let shadow_key = match &shadow {
+            Some(name) => KubeConfig::load(&overlay)?
+                .context(name)
+                .map(|ctx| key_for(ctx, &main)),
+            None => None,
+        };
+
+        let report = import::import(
+            &overlay,
+            &self.paths.main_kubeconfig,
+            shadow.as_deref(),
+            dry_run,
+            &mut |conflict| self.resolve_conflict(conflict, overwrite),
+        )?;
+        self.print_report(&report, dry_run, None);
+
+        let Some(context) = &report.switched_to else {
+            return Ok(report_has_content(&report));
+        };
+        let main = self.main_config()?;
+        match main.context(context) {
+            Some(ctx) if dry_run => {
+                eprintln!(
+                    "kk: would follow the switch to context '{}' made by another tool",
+                    ctx.name
+                );
+            }
+            Some(ctx) => {
+                eprintln!(
+                    "kk: following the switch to context '{}' made by another tool",
+                    ctx.name
+                );
+                let key = Key {
+                    context: ctx.name.clone(),
+                    namespace: ctx
+                        .context
+                        .namespace
+                        .clone()
+                        .unwrap_or_else(|| "default".to_owned()),
+                    user: None,
+                };
+                self.switch_from(shell, key, shadow_key)?;
+            }
+            None => eprintln!(
+                "kk: warning: another tool switched this shell to context '{context}', which isn't in {}",
+                self.paths.main_kubeconfig.display()
+            ),
+        }
+        Ok(true)
+    }
+
+    /// Decides whether an imported entry replaces the main config's differing one:
+    /// yes with `--overwrite`, asks when there's a terminal, otherwise no.
+    fn resolve_conflict(&self, conflict: &Conflict, overwrite: bool) -> Result<bool> {
+        if overwrite {
+            return Ok(true);
+        }
+        let term = dialoguer::console::Term::stderr();
+        if !term.is_term() || !std::io::stdin().is_terminal() {
+            return Ok(false);
+        }
+        eprintln!(
+            "kk: {} in this shell's overlay differs from the one in {}:",
+            conflict.entry,
+            self.paths.main_kubeconfig.display()
+        );
+        for difference in &conflict.differences {
+            eprintln!("      {difference}");
+        }
+        dialoguer::Confirm::new()
+            .with_prompt(format!(
+                "Replace it in {}?",
+                self.paths.main_kubeconfig.display()
+            ))
+            .default(false)
+            .interact_on(&term)
+            .context("asking about a conflict")
+    }
+
+    fn print_report(&self, report: &ImportReport, dry_run: bool, overlay: Option<&Path>) {
+        let main = self.paths.main_kubeconfig.display();
+        let source = match overlay {
+            Some(path) => format!("{}", path.display()),
+            None => "this shell's overlay".to_owned(),
+        };
+        let list = |entries: &[import::Entry]| {
+            entries
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        let (moved, replaced, removed, left) = if dry_run {
+            ("would move", "would replace", "would remove", "would leave")
+        } else {
+            ("moved", "replaced", "removed", "left")
+        };
+        let backup = match &report.backup {
+            Some(path) => format!(" (backup: {})", path.display()),
+            None => String::new(),
+        };
+        if !report.moved.is_empty() {
+            eprintln!(
+                "kk: {moved} {} from {source} into {main}{backup}",
+                list(&report.moved)
+            );
+        }
+        if !report.replaced.is_empty() {
+            let backup = if report.moved.is_empty() {
+                backup.as_str()
+            } else {
+                ""
+            };
+            eprintln!(
+                "kk: {replaced} {} in {main} with the version from {source}{backup}",
+                list(&report.replaced)
+            );
+        }
+        if !report.duplicates.is_empty() {
+            eprintln!(
+                "kk: {removed} {} from {source}; already in {main}",
+                list(&report.duplicates)
+            );
+        }
+        for conflict in &report.conflicts {
+            eprintln!(
+                "kk: warning: {left} {} in {source}: it differs from {main} ({}). Run `kk import --overwrite` to replace it",
+                conflict.entry,
+                conflict.differences.join("; ")
+            );
+        }
+        for key in &report.unmergeable {
+            eprintln!("kk: warning: {left} '{key}' in {source}; kk can't merge it into {main}");
+        }
+    }
+
     /// Points the shell at `key`: writes its overlay, records the use, and exports
     /// `KUBECONFIG`, `KK_PROFILE` and the profile's `env`.
     fn switch(&self, shell: &mut Shell, key: Key) -> Result<()> {
+        let previous = self.overlay_key(shell.pid, &self.main_config()?)?;
+        self.switch_from(shell, key, previous)
+    }
+
+    /// Like `switch`, with the profile the shell is leaving given explicitly.
+    fn switch_from(&self, shell: &mut Shell, key: Key, previous: Option<Key>) -> Result<()> {
         let main = self.main_config()?;
         let Some(context) = main.context(&key.context) else {
+            let in_overlay = KubeConfig::load(&self.paths.overlay_file(shell.pid))
+                .is_ok_and(|overlay| overlay.context(&key.context).is_some());
+            if in_overlay {
+                bail!(
+                    "context '{}' is only in this shell's overlay, where another tool added it; run `kk import` to move it into {}",
+                    key.context,
+                    self.paths.main_kubeconfig.display()
+                );
+            }
             bail!(
                 "context '{}' is not in {} (the profile may be stale)",
                 key.context,
@@ -329,7 +528,6 @@ impl App {
         let overlay = self.paths.overlay_file(shell.pid);
         let state_file = self.paths.state_file(shell.pid);
         let mut state = ShellState::load(&state_file)?;
-        let previous = self.overlay_key(shell.pid, &main)?;
         let unchanged = previous.as_ref() == Some(&key);
 
         let profile = self.store.update(|c| {
@@ -352,9 +550,10 @@ impl App {
                 namespace: Some(key.namespace.clone()),
             },
         };
-        for warning in write_overlay(&overlay, &shadow)? {
+        for warning in write_overlay(&overlay, &shadow, state.shadow.as_deref())? {
             eprintln!("kk: warning: {warning}");
         }
+        state.shadow = Some(shadow.name.clone());
 
         if !unchanged && let Some(previous) = previous {
             state.previous = Some(previous);
@@ -380,8 +579,9 @@ impl App {
             None => eprintln!("kk: switched to {}", key.derived_name()),
         }
 
-        // Opportunistic cleanup; failures here shouldn't fail the switch.
-        let _ = self.remove_dead_shell_files(false);
+        // Opportunistic cleanup; failures here shouldn't fail the switch. It never
+        // imports, since that may need to ask about conflicts.
+        let _ = self.remove_dead_shell_files(false, false);
         Ok(())
     }
 
@@ -398,18 +598,20 @@ impl App {
         if !active {
             return Ok(None);
         }
-        Ok(read_overlay_current(&overlay)?.map(|shadow| {
-            let main_user = main.context(&shadow.name).map(|c| c.context.user.as_str());
-            Key {
-                user: (main_user != Some(shadow.context.user.as_str()))
-                    .then_some(shadow.context.user),
-                namespace: shadow
-                    .context
-                    .namespace
-                    .unwrap_or_else(|| "default".to_owned()),
-                context: shadow.name,
-            }
-        }))
+        if !overlay.exists() {
+            return Ok(None);
+        }
+        // Like kubectl: the overlay's current-context, with the overlay's entry for
+        // it if there is one (e.g. kk's), else the main config's (e.g. after
+        // `kubectl config use-context`).
+        let config = KubeConfig::load(&overlay)?;
+        let Some(name) = config.current_context.as_deref() else {
+            return Ok(None);
+        };
+        Ok(config
+            .context(name)
+            .or_else(|| main.context(name))
+            .map(|ctx| key_for(ctx, main)))
     }
 
     /// The PID of the overlay that `KUBECONFIG` currently starts with, if any.
@@ -580,37 +782,105 @@ impl App {
     /// Removes overlays and state files belonging to shells that no longer exist.
     /// Unless `force` is set, overlays holding entries kk didn't write are kept,
     /// since deleting them would lose those entries.
-    fn remove_dead_shell_files(&self, force: bool) -> Result<Cleanup> {
+    fn remove_dead_shell_files(&self, force: bool, import: bool) -> Result<Cleanup> {
         let mut cleanup = Cleanup::default();
         let entries = match fs::read_dir(&self.paths.runtime_dir) {
             Ok(entries) => entries,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(cleanup),
             Err(e) => return Err(e.into()),
         };
+        let mut dead = std::collections::BTreeSet::new();
         for entry in entries {
-            let entry = entry?;
-            let name = entry.file_name();
-            let Some(pid) = shell_file_pid(&name.to_string_lossy()) else {
-                continue;
-            };
-            if process_alive(pid) {
-                continue;
+            let name = entry?.file_name();
+            if let Some(pid) = shell_file_pid(&name.to_string_lossy())
+                && !process_alive(pid)
+            {
+                dead.insert(pid);
             }
-            let path = entry.path();
-            if !force && name.to_string_lossy().starts_with("overlay.") {
-                let foreign = foreign_entries(&path).unwrap_or_else(|e| {
+        }
+
+        for pid in dead {
+            let overlay = self.paths.overlay_file(pid);
+            let state_file = self.paths.state_file(pid);
+            if !force && overlay.exists() {
+                let shadow = ShellState::load(&state_file)
+                    .ok()
+                    .and_then(|state| state.shadow);
+                if import {
+                    match import::import(
+                        &overlay,
+                        &self.paths.main_kubeconfig,
+                        shadow.as_deref(),
+                        false,
+                        &mut |conflict| self.resolve_conflict(conflict, false),
+                    ) {
+                        Ok(report) => self.print_report(&report, false, Some(&overlay)),
+                        Err(e) => {
+                            eprintln!("kk: warning: importing from {}: {e:#}", overlay.display())
+                        }
+                    }
+                }
+                let foreign = foreign_entries(&overlay, shadow.as_deref()).unwrap_or_else(|e| {
                     // Unreadable: keep it rather than risk losing something.
                     vec![format!("content kk can't parse ({e:#})")]
                 });
                 if !foreign.is_empty() {
-                    cleanup.kept.push((path, foreign));
+                    // Keep the state file too: it records which context is kk's.
+                    cleanup.kept.push((overlay, foreign));
                     continue;
                 }
             }
-            remove_if_exists(&path)?;
-            cleanup.removed += 1;
+            for path in [&overlay, &state_file] {
+                if path.exists() {
+                    remove_if_exists(path)?;
+                    cleanup.removed += 1;
+                }
+            }
         }
         Ok(cleanup)
+    }
+}
+
+#[derive(Clone, Copy)]
+enum ImportMode {
+    /// Before other commands, unless `KK_AUTO_IMPORT=0`.
+    Auto,
+    /// `kk import`.
+    Explicit { dry_run: bool, overwrite: bool },
+}
+
+/// Auto-import is on unless `KK_AUTO_IMPORT` is `0`, `false` or `no`.
+fn auto_import_enabled() -> bool {
+    !matches!(
+        std::env::var("KK_AUTO_IMPORT").as_deref(),
+        Ok("0" | "false" | "no")
+    )
+}
+
+fn report_has_content(report: &ImportReport) -> bool {
+    report.changed_main()
+        || !report.duplicates.is_empty()
+        || !report.conflicts.is_empty()
+        || !report.unmergeable.is_empty()
+}
+
+/// The profile key for a context entry: its namespace (or `default`), and a user
+/// override when it differs from the main config's context of the same name.
+fn key_for(ctx: &NamedContext, main: &KubeConfig) -> Key {
+    let user = match main.context(&ctx.name) {
+        Some(main_ctx) if main_ctx.context.user != ctx.context.user => {
+            Some(ctx.context.user.clone())
+        }
+        _ => None,
+    };
+    Key {
+        context: ctx.name.clone(),
+        namespace: ctx
+            .context
+            .namespace
+            .clone()
+            .unwrap_or_else(|| "default".to_owned()),
+        user,
     }
 }
 

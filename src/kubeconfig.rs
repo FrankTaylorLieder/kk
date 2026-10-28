@@ -64,12 +64,18 @@ impl KubeConfig {
 
 /// Writes the overlay for a shell, selecting `shadow` as the current context.
 ///
-/// Anything else found in an existing overlay (clusters, users or extra contexts,
-/// typically added by a tool such as `aws eks update-kubeconfig`) is carried over
-/// rather than silently dropped. The returned warnings describe what was kept.
-pub fn write_overlay(path: &Path, shadow: &NamedContext) -> Result<Vec<String>> {
+/// `previous_shadow` names the context kk wrote last time, so it can be told apart
+/// from anything else in the overlay. Everything else (clusters, users or extra
+/// contexts, typically added by a tool such as `aws eks update-kubeconfig`) is
+/// carried over rather than silently dropped. The returned warnings describe what
+/// was kept.
+pub fn write_overlay(
+    path: &Path,
+    shadow: &NamedContext,
+    previous_shadow: Option<&str>,
+) -> Result<Vec<String>> {
     let foreign = match read_overlay_mapping(path)? {
-        Some(existing) => Foreign::split(existing),
+        Some(existing) => Foreign::split(existing, previous_shadow),
         None => Foreign::default(),
     };
     let warnings = foreign
@@ -105,28 +111,46 @@ pub fn write_overlay(path: &Path, shadow: &NamedContext) -> Result<Vec<String>> 
 /// Describes the entries in an overlay that kk didn't write, such as a cluster
 /// added by `aws eks update-kubeconfig`. Deleting an overlay with any of these
 /// would lose them. A missing overlay has none.
-pub fn foreign_entries(path: &Path) -> Result<Vec<String>> {
+///
+/// `shadow` names the context kk wrote; if unknown, the overlay's
+/// `current-context` is assumed to be it.
+pub fn foreign_entries(path: &Path, shadow: Option<&str>) -> Result<Vec<String>> {
     Ok(match read_overlay_mapping(path)? {
-        Some(mapping) => Foreign::split(mapping).describe(),
+        Some(mapping) => Foreign::split(mapping, shadow).describe(),
         None => Vec::new(),
     })
 }
 
+/// Whether something other than kk has changed the overlay in a way kk should
+/// pick up: added entries, or switched `current-context` away from kk's context.
+pub fn has_outside_changes(path: &Path, shadow: Option<&str>) -> Result<bool> {
+    let Some(mapping) = read_overlay_mapping(path)? else {
+        return Ok(false);
+    };
+    let current = mapping.get("current-context").and_then(Value::as_str);
+    let switched = shadow.is_some() && current != shadow;
+    Ok(switched || !Foreign::split(mapping, shadow).describe().is_empty())
+}
+
 /// The parts of an overlay that kk didn't write.
 #[derive(Default)]
-struct Foreign {
-    /// Contexts other than the shadow context (the one `current-context` selects).
-    contexts: Vec<Value>,
+pub(crate) struct Foreign {
+    /// Contexts other than the shadow context.
+    pub contexts: Vec<Value>,
     /// Non-empty top-level keys other than the ones kk writes, e.g. `clusters`.
-    other: Mapping,
+    pub other: Mapping,
 }
 
 impl Foreign {
-    fn split(overlay: Mapping) -> Self {
-        let shadow = overlay
-            .get("current-context")
-            .and_then(Value::as_str)
-            .map(str::to_owned);
+    /// Splits out everything except kk's own entries. `shadow` names kk's context;
+    /// if unknown, the overlay's `current-context` is assumed to be it.
+    pub fn split(overlay: Mapping, shadow: Option<&str>) -> Self {
+        let shadow = shadow.map(str::to_owned).or_else(|| {
+            overlay
+                .get("current-context")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        });
         let mut foreign = Foreign::default();
         for (key, value) in overlay {
             match key.as_str() {
@@ -153,7 +177,7 @@ impl Foreign {
     }
 
     /// Human-readable descriptions, e.g. `context 'new'` or `cluster 'new'`.
-    fn describe(&self) -> Vec<String> {
+    pub fn describe(&self) -> Vec<String> {
         let mut entries: Vec<String> = self
             .contexts
             .iter()
@@ -177,19 +201,11 @@ impl Foreign {
     }
 }
 
-fn entry_name(entry: &Value) -> &str {
+pub(crate) fn entry_name(entry: &Value) -> &str {
     entry.get("name").and_then(Value::as_str).unwrap_or("?")
 }
 
-/// Returns the context an overlay currently selects, if the overlay exists and is valid.
-pub fn read_overlay_current(path: &Path) -> Result<Option<NamedContext>> {
-    if !path.exists() {
-        return Ok(None);
-    }
-    Ok(KubeConfig::load(path)?.current().cloned())
-}
-
-fn read_overlay_mapping(path: &Path) -> Result<Option<Mapping>> {
+pub(crate) fn read_overlay_mapping(path: &Path) -> Result<Option<Mapping>> {
     let text = match fs::read_to_string(path) {
         Ok(text) => text,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -205,7 +221,7 @@ fn read_overlay_mapping(path: &Path) -> Result<Option<Mapping>> {
     }
 }
 
-fn is_empty(value: &Value) -> bool {
+pub(crate) fn is_empty(value: &Value) -> bool {
     match value {
         Value::Null => true,
         Value::Sequence(s) => s.is_empty(),
@@ -233,14 +249,14 @@ mod tests {
     fn writes_minimal_overlay() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("overlay");
-        let warnings = write_overlay(&path, &shadow("prod", "team-a")).unwrap();
+        let warnings = write_overlay(&path, &shadow("prod", "team-a"), None).unwrap();
         assert!(warnings.is_empty());
 
-        let current = read_overlay_current(&path).unwrap().unwrap();
+        let current = KubeConfig::load(&path).unwrap().current().cloned().unwrap();
         assert_eq!(current, shadow("prod", "team-a"));
-        assert!(foreign_entries(&path).unwrap().is_empty());
+        assert!(foreign_entries(&path, Some("prod")).unwrap().is_empty());
         assert!(
-            foreign_entries(&dir.path().join("missing"))
+            foreign_entries(&dir.path().join("missing"), None)
                 .unwrap()
                 .is_empty()
         );
@@ -250,7 +266,7 @@ mod tests {
     fn replaces_previous_shadow_and_keeps_foreign_entries() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("overlay");
-        write_overlay(&path, &shadow("prod", "team-a")).unwrap();
+        write_overlay(&path, &shadow("prod", "team-a"), None).unwrap();
 
         // Simulate a tool adding a new cluster/user/context to the overlay.
         let mut text = fs::read_to_string(&path).unwrap();
@@ -262,11 +278,11 @@ mod tests {
         fs::write(&path, text).unwrap();
 
         assert_eq!(
-            foreign_entries(&path).unwrap(),
+            foreign_entries(&path, Some("prod")).unwrap(),
             ["context 'new'", "cluster 'new'"]
         );
 
-        let warnings = write_overlay(&path, &shadow("staging", "team-b")).unwrap();
+        let warnings = write_overlay(&path, &shadow("staging", "team-b"), Some("prod")).unwrap();
         assert_eq!(warnings.len(), 2, "{warnings:?}");
 
         let config = KubeConfig::load(&path).unwrap();
@@ -276,8 +292,33 @@ mod tests {
         assert!(fs::read_to_string(&path).unwrap().contains("https://new"));
         // Still foreign after the switch, so the overlay must not be deleted.
         assert_eq!(
-            foreign_entries(&path).unwrap(),
+            foreign_entries(&path, Some("staging")).unwrap(),
             ["context 'new'", "cluster 'new'"]
+        );
+    }
+
+    #[test]
+    fn tool_switching_current_context_is_detected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("overlay");
+        write_overlay(&path, &shadow("prod", "team-a"), None).unwrap();
+        assert!(!has_outside_changes(&path, Some("prod")).unwrap());
+
+        // Like `aws eks update-kubeconfig`: add a context and make it current.
+        let text = fs::read_to_string(&path)
+            .unwrap()
+            .replace("current-context: prod", "current-context: new")
+            .replace(
+                "contexts:\n",
+                "contexts:\n- name: new\n  context:\n    cluster: new\n    user: new\n",
+            );
+        fs::write(&path, text).unwrap();
+
+        assert!(has_outside_changes(&path, Some("prod")).unwrap());
+        // Knowing the shadow, kk's own context isn't mistaken for a foreign one.
+        assert_eq!(
+            foreign_entries(&path, Some("prod")).unwrap(),
+            ["context 'new'"]
         );
     }
 }

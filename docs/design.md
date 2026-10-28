@@ -63,6 +63,12 @@ This works because of kubeconfig merge and write rules:
 - `kk clean` deletes overlays whose PID is no longer alive.
 - The previous profile is tracked per shell, not globally, so that `-` (go back)
   works independently in each window.
+- A per-shell state file (`state.<pid>.json`) records:
+  - the previous profile
+  - the env vars set from the profile
+  - the name of the context entry kk wrote into the overlay
+
+  It's kept as long as the overlay is.
 
 ## Architecture: binary + thin shell function
 
@@ -208,8 +214,9 @@ All functionality is exposed as subcommands of `kk`.
 | `kk profile rm <name>` | remove a profile from the catalogue |
 | `kk context [context]` | switch context in this shell (fzf if no argument), keeping the namespace from the most recent profile for that context, else `default`; records the combination |
 | `kk namespace [namespace]` | switch namespace within the current context (fzf if no argument); records the combination |
-| `kk clean [--force]` | remove overlays for dead PIDs, except overlays holding entries kk didn't write (unless `--force`) |
-| `kk exit [--force]` | delete this shell's overlay, unset `KUBECONFIG` and any profile `env` vars; back to the plain main config. Refuses if the overlay holds entries kk didn't write (unless `--force`) |
+| `kk import [--dry-run] [--overwrite]` | move entries other tools added to this shell's overlay into the main config (see [Overlay migration](#overlay-migration)) |
+| `kk clean [--force]` | remove overlays for dead PIDs, importing their foreign entries first; keeps overlays that still hold some (unless `--force`) |
+| `kk exit [--force]` | delete this shell's overlay, unset `KUBECONFIG` and any profile `env` vars; back to the plain main config. Imports first; refuses if foreign entries remain (unless `--force`) |
 | `kk init <shell>` | print the shell function (and optional aliases) to `eval` from the rc file |
 
 Switching to a profile writes or rewrites this shell's overlay and exports
@@ -258,21 +265,59 @@ alias kns='kk namespace'
 
 - **New entries land in the overlay.** Commands that *add* clusters or users, such as
   `aws eks update-kubeconfig` or `gcloud container clusters get-credentials`, create
-  them in the first file. Two possible fixes:
-  - wrap or alias these commands to target the main file
-    (`KUBECONFIG=~/.kube/config …` or `--kubeconfig`)
-  - have `kk` detect non-context stanzas in an overlay and migrate them back
-    into `~/.kube/config` (TODO)
-
-  Until migration exists, kk guards these entries:
-  - **On a switch:** they are carried over into the rewritten overlay, with a warning.
-  - **`kk exit` and `kk clean`:** they refuse to delete an overlay holding them,
-    unless `--force` is passed.
-  - **Unparseable overlays:** they count as holding such entries, so they are kept.
-
-  It is unconfirmed whether every tool follows kubectl's "first file" rule.
+  them in the first file. They usually also set `current-context` there, switching
+  the shell to the new context. See [Overlay migration](#overlay-migration).
 - **Exec/OIDC auth:** with the overlay model, refreshed credentials go to the main
   file, unlike the copy-based approach.
+
+## Overlay migration
+
+kk moves entries other tools write into an overlay into the main kubeconfig,
+where they would have gone without kk.
+
+- **Telling kk's entry apart:** the shell's state file records the name of the
+  context entry kk wrote (`shadow`). Everything else in the overlay is foreign. kk
+  doesn't infer its own entry from `current-context`, because tools change that.
+  For state written before this existed, kk falls back to `current-context`.
+- **When it runs:**
+  - **Automatically,** at the start of `kk profile`, `kk context`, `kk namespace`
+    and `kk exit` in that shell, unless `KK_AUTO_IMPORT=0`.
+  - **Explicitly,** with `kk import [--dry-run] [--overwrite]`.
+  - **In `kk clean`,** for dead shells' overlays, before deleting them. This is
+    also skipped when `KK_AUTO_IMPORT=0`.
+  - **Never** in the opportunistic cleanup during a switch, since that may need
+    to ask about conflicts.
+- **What moves:**
+  - clusters, users, and contexts other than kk's. Other top-level keys are left
+    in the overlay with a warning.
+  - **New names** are appended to the main config's lists.
+  - **Identical entries** already in the main config are just removed from the
+    overlay.
+  - **A different entry with the same name is a conflict:**
+    - **`--overwrite`:** replaces the main config's version.
+    - **With a terminal:** kk shows the differing field paths and asks
+      (default no). Values are shown only for context fields and `*.server`, never
+      for user credentials or certificate data.
+    - **Otherwise:** the entry stays in the overlay, with a warning.
+- **Following a switch:** if the overlay's `current-context` is no longer kk's
+  context, and that context is in the main config after the import, kk switches
+  the shell to it with a normal kk overlay. The previous profile is what kk had
+  before. This also covers `kubectl config use-context` in a kk shell.
+- **Writing the main config:**
+  - under kubectl's lock file (`<file>.lock`, created exclusively, as client-go
+    does), waiting up to 3 seconds
+  - after copying the current file to `<file>.kk-backup`, a single rolling backup
+  - replaced atomically, through any symlink, keeping its permissions
+  - unknown fields and order are preserved; YAML comments are not
+- **Guards:**
+  - `kk exit` and `kk clean` refuse to delete an overlay that still holds foreign
+    entries, unless `--force` is passed. That covers declined conflicts, auto-import
+    turned off, and unmergeable keys.
+  - Unparseable overlays are kept.
+  - A switch carries foreign entries over into the rewritten overlay, with a
+    warning.
+- **Prompt marker:** `kk profile current` appends `!` when the overlay has foreign
+  entries or a `current-context` other than kk's.
 
 ## Implementation: Rust
 

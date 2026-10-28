@@ -91,6 +91,7 @@ kk profile name NAME          # name the current profile
 kk profile list               # list profiles
 kk profile current [--short]     # print the current profile's name (for prompts)
 kk profile rm NAME            # remove a profile
+kk import [--dry-run] [--overwrite]  # move entries other tools added into ~/.kube/config
 kk exit [--force]             # this shell goes back to the plain ~/.kube/config
 kk clean [--force]            # remove overlays left by shells that have exited
 ```
@@ -212,6 +213,56 @@ Namespace lists are cached per context so the picker opens instantly. If the cac
 is more than 5 minutes old, it's refreshed in the background for next time. Use
 `kk namespace --refresh` to fetch a fresh list immediately.
 
+### Clusters added by other tools
+
+Tools that add clusters write their new entries into the first kubeconfig file,
+which in a `kk` shell is the shell's overlay. Examples are
+`aws eks update-kubeconfig` and `gcloud container clusters get-credentials`. They
+usually also switch the shell to the new context. `kk` picks this up on your next
+`kk` command in that shell:
+
+```
+$ aws eks update-kubeconfig --name foo
+$ kk ns apps
+kk: moved cluster 'foo', user 'foo', context 'foo' from this shell's overlay into ~/.kube/config (backup: ~/.kube/config.kk-backup)
+kk: following the switch to context 'foo' made by another tool
+kk: switched to foo/default
+kk: switched to foo/apps
+```
+
+- **Where the entries go:** they move to `~/.kube/config`, where the tool would
+  have put them without `kk`. That makes them available to every shell. The shell
+  stays on the context the tool switched it to.
+- **Context switches:** `kubectl config use-context` inside a `kk` shell is followed
+  the same way.
+- **Duplicates:** entries identical to ones already in `~/.kube/config` are just
+  removed from the overlay.
+- **Conflicts:** an entry with the same name as one in `~/.kube/config` but
+  different contents is a conflict. For example, a tool re-wrote an existing
+  cluster with a new endpoint.
+  - **With a terminal:** `kk` shows what differs and asks before replacing.
+    Values that may be secret, such as tokens and certificates, are never shown.
+  - **Without one, or if you decline:** the entry stays in the overlay, with a
+    warning.
+- **Safety:**
+  - `kk` writes `~/.kube/config` while holding kubectl's own lock file
+    (`~/.kube/config.lock`).
+  - It saves the previous version to `~/.kube/config.kk-backup` first.
+  - It replaces the file atomically, keeping its permissions and the order of its
+    entries.
+  - It doesn't keep YAML comments.
+- **`kk exit` and `kk clean`** import before deleting an overlay. They refuse to
+  delete one that still holds entries, such as declined conflicts, unless you
+  pass `--force`.
+
+To review before anything is moved, set `KK_AUTO_IMPORT=0`, then import yourself:
+
+```sh
+kk import --dry-run      # show what would be moved, replaced or left
+kk import                # import, asking about conflicts
+kk import --overwrite    # import, replacing conflicting entries without asking
+```
+
 ### Prompt
 
 `kk profile current` prints the current shell's profile: its name if you've given it
@@ -222,6 +273,11 @@ one, otherwise `<context>/<namespace>`.
 
 It reads the shell's overlay directly, so it stays accurate even after you change
 the namespace with `kubectl` itself.
+
+It adds a `!` (e.g. `prod/team-a!`) when another tool has changed the shell's
+overlay and `kk` hasn't picked it up yet. That means added entries or a switched
+context. Your next `kk` command, or `kk import`, deals with it. See
+[Clusters added by other tools](#clusters-added-by-other-tools).
 
 Long context and namespace names can make for an unwieldy prompt. `--short` (`-s`)
 abbreviates both parts of an unnamed profile:
@@ -278,6 +334,7 @@ without changes.
 | `KK_CONFIG_DIR` | `~/.config/kk` | Holds `profiles.yaml` |
 | `KK_RUNTIME_DIR` | `$XDG_RUNTIME_DIR/kk`, or `$TMPDIR/kk-<uid>` | Per-shell overlays and state (mode `0700`) |
 | `KK_CACHE_DIR` | `~/.cache/kk` | Namespace cache |
+| `KK_AUTO_IMPORT` | on | Set to `0` to stop `kk` importing entries other tools add to overlays until you run `kk import` |
 
 Variables `kk` sets in your shell:
 
@@ -289,25 +346,9 @@ Variables `kk` sets in your shell:
 
 ## Caveats
 
-- **Commands that add clusters** write the new entry into the first kubeconfig
-  file, which is the shell's overlay. Examples are
-  `aws eks update-kubeconfig` and `gcloud container clusters get-credentials`.
-  Point them at the main file instead:
-
-  ```sh
-  aws eks update-kubeconfig --kubeconfig ~/.kube/config --name my-cluster
-  # or
-  KUBECONFIG=~/.kube/config gcloud container clusters get-credentials my-cluster
-  ```
-
-  If an entry does land in an overlay, `kk` protects it:
-  - **On a switch:** the entry is kept, with a warning, rather than dropped.
-  - **`kk exit`:** refuses to delete the overlay and names the entries.
-  - **`kk clean`:** keeps that shell's overlay and names the entries.
-
-  Move the entries into `~/.kube/config` first. You can see them with
-  `kubectl --kubeconfig <overlay> config view --raw`. Or pass `--force` to discard
-  them.
+- **YAML comments in `~/.kube/config` are lost** when `kk` imports entries into
+  it (see [Clusters added by other tools](#clusters-added-by-other-tools)). The
+  previous version is kept in `~/.kube/config.kk-backup`.
 - **Changing the namespace with kubectl directly**
   (`kubectl config set-context --current --namespace=…`) works and only affects
   the current shell. `kk profile current` reflects it immediately, but `KK_PROFILE`
