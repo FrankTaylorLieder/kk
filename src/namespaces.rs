@@ -33,6 +33,23 @@ pub fn list(paths: &Paths, context: &str, refresh: bool) -> Result<Vec<String>> 
     fetch_and_cache(paths, context)
 }
 
+/// Returns the cached namespaces without ever waiting on kubectl, for tab completion.
+/// A missing or stale cache is refreshed in the background for next time.
+pub fn cached(paths: &Paths, context: &str) -> Vec<String> {
+    match read_cache(&cache_file(paths, context)) {
+        Some(entry) => {
+            if Utc::now() - entry.fetched_at > STALE_AFTER {
+                spawn_background_refresh(context);
+            }
+            entry.namespaces
+        }
+        None => {
+            spawn_background_refresh(context);
+            Vec::new()
+        }
+    }
+}
+
 /// Fetches namespaces with kubectl and updates the cache.
 pub fn fetch_and_cache(paths: &Paths, context: &str) -> Result<Vec<String>> {
     let namespaces = fetch(&paths.main_kubeconfig, context)?;

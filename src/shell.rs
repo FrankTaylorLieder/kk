@@ -119,8 +119,8 @@ impl ShellState {
 }
 
 /// The snippet `kk init` prints for `eval` in a shell rc file.
-pub fn init_script(_kind: ShellKind, aliases: bool) -> String {
-    // The same function works in bash and zsh; `kind` is there for shells that differ.
+pub fn init_script(kind: ShellKind, aliases: bool) -> String {
+    // The same function works in bash and zsh.
     let mut script = String::from(
         r#"kk() {
   local __kk_eval __kk_rc
@@ -135,6 +135,19 @@ pub fn init_script(_kind: ShellKind, aliases: bool) -> String {
 }
 "#,
     );
+    // Tab completion calls back into the binary (see `completion.rs`). Registering it
+    // for the name `kk` covers the function too, and zsh also completes the aliases.
+    script.push_str(match kind {
+        ShellKind::Bash => "eval \"$(KK_COMPLETE=bash command kk)\"\n",
+        ShellKind::Zsh => {
+            r#"if (( $+functions[compdef] )); then
+  eval "$(KK_COMPLETE=zsh command kk)"
+else
+  print -u2 "kk: tab completion not enabled: run 'autoload -Uz compinit && compinit' before kk init"
+fi
+"#
+        }
+    });
     if aliases {
         script
             .push_str("alias kp='kk profile'\nalias kctx='kk context'\nalias kns='kk namespace'\n");

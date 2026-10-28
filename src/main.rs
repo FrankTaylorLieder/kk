@@ -1,5 +1,7 @@
+mod abbrev;
 mod catalogue;
 mod commands;
+mod completion;
 mod kubeconfig;
 mod namespaces;
 mod paths;
@@ -8,7 +10,8 @@ mod shell;
 
 use std::process::ExitCode;
 
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, CommandFactory, Parser, Subcommand};
+use clap_complete::ArgValueCandidates;
 
 use commands::{App, Cancelled, Silent};
 use shell::ShellKind;
@@ -27,14 +30,18 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     /// Switch this shell to a profile, picking one if no name is given
-    #[command(visible_alias = "p")]
+    #[command(alias = "p")]
     Profile(ProfileArgs),
     /// Switch this shell to a context, picking one if none is given
     #[command(visible_alias = "ctx")]
-    Context { context: Option<String> },
+    Context {
+        #[arg(add = ArgValueCandidates::new(completion::contexts))]
+        context: Option<String>,
+    },
     /// Switch this shell to a namespace in the current context, picking one if none is given
     #[command(visible_alias = "ns")]
     Namespace {
+        #[arg(add = ArgValueCandidates::new(completion::namespaces))]
         namespace: Option<String>,
         /// Re-fetch the namespace list instead of using the cache
         #[arg(long)]
@@ -70,6 +77,7 @@ struct ProfileArgs {
     #[command(subcommand)]
     action: Option<ProfileAction>,
     /// Profile name, `<context>/<namespace>`, or `-` for this shell's previous profile
+    #[arg(add = ArgValueCandidates::new(completion::profiles))]
     profile: Option<String>,
 }
 
@@ -81,12 +89,23 @@ enum ProfileAction {
     #[command(visible_alias = "ls")]
     List,
     /// Remove a profile from the catalogue
-    Rm { name: String },
+    Rm {
+        #[arg(add = ArgValueCandidates::new(completion::profiles))]
+        name: String,
+    },
     /// Print the current profile's name (or <context>/<namespace>), e.g. for a prompt
-    Current,
+    Current {
+        /// Abbreviate the context and namespace, keeping them unique among known ones
+        #[arg(short, long)]
+        short: bool,
+    },
 }
 
 fn main() -> ExitCode {
+    clap_complete::CompleteEnv::with_factory(Cli::command)
+        .var("KK_COMPLETE")
+        .complete();
+
     let cli = Cli::parse();
     match run(cli) {
         Ok(()) => ExitCode::SUCCESS,
@@ -106,7 +125,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             Some(ProfileAction::Name { name }) => app.profile_name(&name),
             Some(ProfileAction::List) => app.profile_list(),
             Some(ProfileAction::Rm { name }) => app.profile_rm(&name),
-            Some(ProfileAction::Current) => app.profile_current(),
+            Some(ProfileAction::Current { short }) => app.profile_current(short),
             None => app.profile(args.profile),
         },
         Command::Context { context } => app.context(context),

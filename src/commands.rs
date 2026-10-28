@@ -3,6 +3,7 @@ use std::fs;
 use anyhow::{Result, anyhow, bail};
 use chrono::{DateTime, Utc};
 
+use crate::abbrev::abbreviate;
 use crate::catalogue::{Catalogue, Key, Profile, Store};
 use crate::kubeconfig::{
     ContextFields, KubeConfig, NamedContext, foreign_entries, read_overlay_current, write_overlay,
@@ -149,16 +150,36 @@ impl App {
 
     /// Prints the current profile's name, or its derived `<context>/<namespace>` name.
     /// Cheap and quiet so it can run in a prompt.
-    pub fn profile_current(&self) -> Result<()> {
+    /// With `short`, an unnamed profile's context and namespace are abbreviated to
+    /// stay unique among the main config's contexts and the namespaces profiles use
+    /// with that context. Names given with `kk profile name` are shown as they are.
+    pub fn profile_current(&self, short: bool) -> Result<()> {
         let main = self.main_config()?;
         // Find the overlay from KUBECONFIG, so this works when run as `command kk`
         // from a prompt, without the shell function.
         let Some(key) = self.current_key(self.active_overlay_pid(), &main)? else {
             return Err(Silent.into());
         };
-        let name = match self.store.load()?.profile(&key) {
-            Some(profile) => profile.display_name(),
-            None => key.derived_name(),
+        let catalogue = self.store.load()?;
+        let name = match catalogue.profile(&key) {
+            Some(Profile {
+                name: Some(name), ..
+            }) => name.clone(),
+            _ if short => {
+                let contexts = main.contexts.iter().map(|c| c.name.as_str());
+                let namespaces = catalogue
+                    .profiles
+                    .iter()
+                    .filter(|p| p.context == key.context)
+                    .map(|p| p.namespace.as_str());
+                let short_key = Key {
+                    context: abbreviate(&key.context, contexts),
+                    namespace: abbreviate(&key.namespace, namespaces),
+                    user: key.user.clone(),
+                };
+                short_key.derived_name()
+            }
+            _ => key.derived_name(),
         };
         println!("{name}");
         Ok(())
@@ -484,16 +505,22 @@ impl App {
         ordered
     }
 
-    /// Namespaces for the picker: those already used with this context (in frecency
-    /// order), then the rest of the cluster's namespaces.
-    fn namespace_candidates(&self, current: &Key, refresh: bool) -> Result<Vec<String>> {
+    /// Namespaces already used with `context`, in frecency order.
+    fn used_namespaces(&self, context: &str) -> Result<Vec<String>> {
         let catalogue = self.store.load()?;
         let mut items: Vec<String> = Vec::new();
         for profile in catalogue.ordered(self.now) {
-            if profile.context == current.context && !items.contains(&profile.namespace) {
+            if profile.context == context && !items.contains(&profile.namespace) {
                 items.push(profile.namespace.clone());
             }
         }
+        Ok(items)
+    }
+
+    /// Namespaces for the picker: those already used with this context (in frecency
+    /// order), then the rest of the cluster's namespaces.
+    fn namespace_candidates(&self, current: &Key, refresh: bool) -> Result<Vec<String>> {
+        let mut items = self.used_namespaces(&current.context)?;
 
         match namespaces::list(&self.paths, &current.context, refresh) {
             Ok(listed) => {
@@ -505,6 +532,47 @@ impl App {
             }
             Err(e) if !items.is_empty() => eprintln!("kk: warning: {e:#}"),
             Err(e) => return Err(e.context("pass the namespace as an argument instead")),
+        }
+        Ok(items)
+    }
+
+    /// Profile completions: `(value, description)` in picker order. Named profiles
+    /// complete by name, described by their `<context>/<namespace>`.
+    pub fn complete_profiles(&self) -> Result<Vec<(String, Option<String>)>> {
+        let catalogue = self.store.load()?;
+        Ok(catalogue
+            .ordered(self.now)
+            .into_iter()
+            .map(|p| match &p.name {
+                Some(name) => (name.clone(), Some(p.key().derived_name())),
+                None => (p.key().derived_name(), None),
+            })
+            .collect())
+    }
+
+    /// Context completions, most used first.
+    pub fn complete_contexts(&self) -> Result<Vec<String>> {
+        let main = self.main_config()?;
+        let catalogue = self.store.load()?;
+        Ok(self
+            .ordered_contexts(&main, &catalogue)
+            .into_iter()
+            .map(|c| c.name.clone())
+            .collect())
+    }
+
+    /// Namespace completions for the shell's current context: namespaces already used
+    /// with it, then the cached list. Never waits on kubectl.
+    pub fn complete_namespaces(&self) -> Result<Vec<String>> {
+        let main = self.main_config()?;
+        let Some(current) = self.current_key(self.active_overlay_pid(), &main)? else {
+            return Ok(Vec::new());
+        };
+        let mut items = self.used_namespaces(&current.context)?;
+        for ns in namespaces::cached(&self.paths, &current.context) {
+            if !items.contains(&ns) {
+                items.push(ns);
+            }
         }
         Ok(items)
     }

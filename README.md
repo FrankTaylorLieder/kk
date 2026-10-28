@@ -75,6 +75,11 @@ The integration defines a `kk` shell function that wraps the binary. It's needed
 because a program can't change its parent shell's environment. Without it, the
 commands that switch context or namespace stop with instructions to set it up.
 
+The integration also enables tab completion. In zsh, `compinit` must already be
+loaded when `kk init` runs, so put the `eval` line after `compinit`, or after your
+framework (e.g. oh-my-zsh) has loaded. If it isn't loaded, `kk init` prints a hint
+and skips completion.
+
 ## Usage
 
 ```sh
@@ -84,7 +89,7 @@ kk profile [NAME]             # switch to a saved profile (picker if omitted)
 kk profile -                  # back to this shell's previous profile
 kk profile name NAME          # name the current profile
 kk profile list               # list profiles
-kk profile current               # print the current profile's name (for prompts)
+kk profile current [--short]     # print the current profile's name (for prompts)
 kk profile rm NAME            # remove a profile
 kk exit [--force]             # this shell goes back to the plain ~/.kube/config
 kk clean [--force]            # remove overlays left by shells that have exited
@@ -169,6 +174,25 @@ profiles:
       AWS_PROFILE: prod
 ```
 
+### Tab completion
+
+TAB completes values as well as subcommands and flags:
+
+| Command | Completes |
+|---|---|
+| `kk context <TAB>` | contexts from `~/.kube/config`, most used first |
+| `kk profile <TAB>`, `kk profile rm <TAB>` | profile names, and `<context>/<namespace>` for unnamed ones, in picker order. Named profiles show their `<context>/<namespace>` as a description in zsh |
+| `kk namespace <TAB>` | namespaces already used with the current context, then the cached namespace list |
+
+- **Speed:** completion never waits on `kubectl`. If a context has no cached
+  namespace list yet, or the list is stale, it's refreshed in the background, so
+  the next TAB has it.
+- **zsh aliases:** `kp`, `kctx` and `kns` complete like the commands they expand
+  to.
+- **bash aliases:** bash doesn't complete aliases, so use the `kk …` forms there.
+- **Colons in bash:** context names containing `:`, such as EKS ARNs, can complete
+  oddly, because bash splits words at `:`.
+
 ### Pickers
 
 The pickers for `kk profile`, `kk context` and `kk namespace` use:
@@ -199,6 +223,30 @@ one, otherwise `<context>/<namespace>`.
 It reads the shell's overlay directly, so it stays accurate even after you change
 the namespace with `kubectl` itself.
 
+Long context and namespace names can make for an unwieldy prompt. `--short` (`-s`)
+abbreviates both parts of an unnamed profile:
+
+```
+$ kk profile current
+public-local-se-sto-management/evroc-operator-system
+$ kk profile current --short
+p-l-s-s-m/e-o-s
+```
+
+How the abbreviation works:
+
+- **Segments:** names are split at `-`, `_`, `.`, `:` and `/`.
+- **Shortening:** working left to right, each segment is cut to the shortest
+  prefix that still keeps the name unique, in the style of powerlevel10k's
+  `truncate_to_unique`.
+- **What it's unique among:**
+  - the context, among the contexts in your kubeconfig
+  - the namespace, among the namespaces your profiles use with that context. The
+    cluster isn't queried, so this stays fast enough for a prompt.
+- **Changes over time:** an abbreviation can get longer when you add a context or
+  start using a similar namespace.
+- **Named profiles** are always shown with their name in full.
+
 Call the binary with `command kk` in prompts. It doesn't need the shell function,
 and that skips the function's temp-file handling on every prompt.
 
@@ -206,7 +254,7 @@ zsh:
 
 ```sh
 setopt PROMPT_SUBST
-PROMPT='%F{cyan}$(command kk profile current 2>/dev/null)%f %~ %# '
+PROMPT='%F{cyan}$(command kk profile current --short 2>/dev/null)%f %~ %# '
 ```
 
 bash:

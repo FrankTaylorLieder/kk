@@ -204,7 +204,7 @@ All functionality is exposed as subcommands of `kk`.
 | `kk profile -` | return to this shell's previous profile |
 | `kk profile name <new-name>` | name the current shell's profile |
 | `kk profile list` | list the catalogue |
-| `kk profile current` | print the current profile's name, or `<context>/<namespace>` if unnamed; for prompts (see below) |
+| `kk profile current [--short]` | print the current profile's name, or `<context>/<namespace>` if unnamed; for prompts (see below). `--short` abbreviates an unnamed profile's context and namespace |
 | `kk profile rm <name>` | remove a profile from the catalogue |
 | `kk context [context]` | switch context in this shell (fzf if no argument), keeping the namespace from the most recent profile for that context, else `default`; records the combination |
 | `kk namespace [namespace]` | switch namespace within the current context (fzf if no argument); records the combination |
@@ -235,6 +235,20 @@ alias kns='kk namespace'
   - It reflects namespace changes made with `kubectl` directly.
   - Without an active overlay, it falls back to the main config's current context.
     With no context at all, it prints nothing and exits 1.
+
+  - `--short` abbreviates long derived names for prompts, e.g.
+    `public-local-se-sto-management/evroc-operator-system` → `p-l-s-s-m/e-o-s`.
+    - Names are split into segments at `-`, `_`, `.`, `:` and `/`.
+    - Left to right, each segment is cut to the shortest prefix that keeps the name
+      unique among its peers (powerlevel10k's `truncate_to_unique`, applied to name
+      segments).
+    - The peers of the context are the main config's contexts. The peers of the
+      namespace are the namespaces that catalogue profiles use with that context;
+      no cluster query is made.
+    - An abbreviation matches a peer when the separators are identical and each
+      segment is a prefix. Segments left at full length must match exactly, so the
+      result is always unique.
+    - Named profiles are never abbreviated.
 
   `kube-ps1` reads the merged config, so it should show context/namespace
   unchanged. This is unverified. `kk` could also export `KK_PROFILE` for prompts
@@ -304,10 +318,21 @@ alias kns='kk namespace'
 - **Paths:** XDG directories via `dirs`. Without `XDG_RUNTIME_DIR` (e.g. macOS),
   overlays go in `$TMPDIR/kk-<uid>/`. `KK_MAIN_KUBECONFIG`, `KK_CONFIG_DIR`,
   `KK_RUNTIME_DIR` and `KK_CACHE_DIR` override the locations, mainly for testing.
-- **Subcommand aliases:** `kk p`, `kk ctx`, `kk ns` and `kk profile ls`, in
+- **Subcommand aliases:** `kk p` (hidden), `kk ctx`, `kk ns` and `kk profile ls`, in
   addition to the shell aliases `kk init --aliases` defines.
 - **Shells:** bash and zsh at minimum; fish to be decided. Only the `kk init`
   snippet differs per shell.
+- **Tab completion:** uses `clap_complete`'s dynamic completion.
+  - `kk init` registers it by evaluating `KK_COMPLETE=<shell> kk`. The shell then
+    calls back into the binary on each TAB.
+  - `ArgValueCandidates` on the context, namespace and profile arguments supply
+    values in the same order as the pickers.
+  - Namespace candidates come only from the catalogue and the cache, never a live
+    `kubectl` call. A missing or stale cache triggers a background refresh.
+  - Registration is for the name `kk`, so it applies to the shell function. zsh
+    also completes the `kp`/`kctx`/`kns` aliases, but bash doesn't complete aliases.
+  - `kk p` is a hidden alias. If it were visible, the completion engine would offer
+    `p` instead of `profile`.
 
 ## Open decisions
 
