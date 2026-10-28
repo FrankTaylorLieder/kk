@@ -5,7 +5,7 @@ use chrono::{DateTime, Utc};
 
 use crate::catalogue::{Catalogue, Key, Profile, Store};
 use crate::kubeconfig::{
-    ContextFields, KubeConfig, NamedContext, read_overlay_current, write_overlay,
+    ContextFields, KubeConfig, NamedContext, foreign_entries, read_overlay_current, write_overlay,
 };
 use crate::namespaces;
 use crate::paths::Paths;
@@ -236,14 +236,40 @@ impl App {
         shell.finish()
     }
 
-    pub fn clean(&self) -> Result<()> {
-        let removed = self.remove_dead_shell_files()?;
-        eprintln!("kk: removed {removed} stale file(s)");
+    pub fn clean(&self, force: bool) -> Result<()> {
+        let cleanup = self.remove_dead_shell_files(force)?;
+        eprintln!("kk: removed {} stale file(s)", cleanup.removed);
+        for (overlay, entries) in &cleanup.kept {
+            eprintln!(
+                "kk: warning: kept {} because it holds {}",
+                overlay.display(),
+                entries.join(", ")
+            );
+        }
+        if !cleanup.kept.is_empty() {
+            eprintln!(
+                "kk: move those entries into {} (inspect with `kubectl --kubeconfig <overlay> config view --raw`), or run `kk clean --force` to discard them",
+                self.paths.main_kubeconfig.display()
+            );
+        }
         Ok(())
     }
 
-    pub fn exit(&self) -> Result<()> {
+    pub fn exit(&self, force: bool) -> Result<()> {
         let mut shell = Shell::require()?;
+        let overlay = self.paths.overlay_file(shell.pid);
+        if !force {
+            let entries = foreign_entries(&overlay)?;
+            if !entries.is_empty() {
+                bail!(
+                    "not exiting: this shell's overlay holds {}, probably added by another tool, which would be lost.\n\
+                     Move them into {} (inspect with `kubectl --kubeconfig {} config view --raw`), or run `kk exit --force` to discard them",
+                    entries.join(", "),
+                    self.paths.main_kubeconfig.display(),
+                    overlay.display()
+                );
+            }
+        }
         let state_file = self.paths.state_file(shell.pid);
         let state = ShellState::load(&state_file)?;
         for name in &state.env_keys {
@@ -251,7 +277,7 @@ impl App {
         }
         shell.unset("KUBECONFIG");
         shell.unset("KK_PROFILE");
-        remove_if_exists(&self.paths.overlay_file(shell.pid))?;
+        remove_if_exists(&overlay)?;
         remove_if_exists(&state_file)?;
         eprintln!("kk: back to {}", self.paths.main_kubeconfig.display());
         shell.finish()
@@ -334,7 +360,7 @@ impl App {
         }
 
         // Opportunistic cleanup; failures here shouldn't fail the switch.
-        let _ = self.remove_dead_shell_files();
+        let _ = self.remove_dead_shell_files(false);
         Ok(())
     }
 
@@ -484,26 +510,47 @@ impl App {
     }
 
     /// Removes overlays and state files belonging to shells that no longer exist.
-    fn remove_dead_shell_files(&self) -> Result<usize> {
+    /// Unless `force` is set, overlays holding entries kk didn't write are kept,
+    /// since deleting them would lose those entries.
+    fn remove_dead_shell_files(&self, force: bool) -> Result<Cleanup> {
+        let mut cleanup = Cleanup::default();
         let entries = match fs::read_dir(&self.paths.runtime_dir) {
             Ok(entries) => entries,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(cleanup),
             Err(e) => return Err(e.into()),
         };
-        let mut removed = 0;
         for entry in entries {
             let entry = entry?;
             let name = entry.file_name();
             let Some(pid) = shell_file_pid(&name.to_string_lossy()) else {
                 continue;
             };
-            if !process_alive(pid) {
-                remove_if_exists(&entry.path())?;
-                removed += 1;
+            if process_alive(pid) {
+                continue;
             }
+            let path = entry.path();
+            if !force && name.to_string_lossy().starts_with("overlay.") {
+                let foreign = foreign_entries(&path).unwrap_or_else(|e| {
+                    // Unreadable: keep it rather than risk losing something.
+                    vec![format!("content kk can't parse ({e:#})")]
+                });
+                if !foreign.is_empty() {
+                    cleanup.kept.push((path, foreign));
+                    continue;
+                }
+            }
+            remove_if_exists(&path)?;
+            cleanup.removed += 1;
         }
-        Ok(removed)
+        Ok(cleanup)
     }
+}
+
+#[derive(Default)]
+struct Cleanup {
+    removed: usize,
+    /// Overlays kept because they hold entries kk didn't write, with descriptions.
+    kept: Vec<(std::path::PathBuf, Vec<String>)>,
 }
 
 /// Extracts the PID from `overlay.<pid>` or `state.<pid>.json`.

@@ -208,8 +208,8 @@ All functionality is exposed as subcommands of `kk`.
 | `kk profile rm <name>` | remove a profile from the catalogue |
 | `kk context [context]` | switch context in this shell (fzf if no argument), keeping the namespace from the most recent profile for that context, else `default`; records the combination |
 | `kk namespace [namespace]` | switch namespace within the current context (fzf if no argument); records the combination |
-| `kk clean` | remove overlays for dead PIDs |
-| `kk exit` | delete this shell's overlay, unset `KUBECONFIG` and any profile `env` vars; back to the plain main config |
+| `kk clean [--force]` | remove overlays for dead PIDs, except overlays holding entries kk didn't write (unless `--force`) |
+| `kk exit [--force]` | delete this shell's overlay, unset `KUBECONFIG` and any profile `env` vars; back to the plain main config. Refuses if the overlay holds entries kk didn't write (unless `--force`) |
 | `kk init <shell>` | print the shell function (and optional aliases) to `eval` from the rc file |
 
 Switching to a profile writes or rewrites this shell's overlay and exports
@@ -248,7 +248,13 @@ alias kns='kk namespace'
   - wrap or alias these commands to target the main file
     (`KUBECONFIG=~/.kube/config …` or `--kubeconfig`)
   - have `kk` detect non-context stanzas in an overlay and migrate them back
-    into `~/.kube/config`
+    into `~/.kube/config` (TODO)
+
+  Until migration exists, kk guards these entries:
+  - **On a switch:** they are carried over into the rewritten overlay, with a warning.
+  - **`kk exit` and `kk clean`:** they refuse to delete an overlay holding them,
+    unless `--force` is passed.
+  - **Unparseable overlays:** they count as holding such entries, so they are kept.
 
   It is unconfirmed whether every tool follows kubectl's "first file" rule.
 - **Exec/OIDC auth:** with the overlay model, refreshed credentials go to the main

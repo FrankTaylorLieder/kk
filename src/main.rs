@@ -41,9 +41,17 @@ enum Command {
         refresh: bool,
     },
     /// Remove overlays left behind by shells that have exited
-    Clean,
+    Clean {
+        /// Also remove overlays holding entries kk didn't write (e.g. clusters added by other tools)
+        #[arg(long)]
+        force: bool,
+    },
     /// Return this shell to the plain main kubeconfig
-    Exit,
+    Exit {
+        /// Exit even if the overlay holds entries kk didn't write, discarding them
+        #[arg(long)]
+        force: bool,
+    },
     /// Print the shell integration; add `eval "$(command kk init zsh)"` to your rc file
     Init {
         shell: ShellKind,
@@ -103,8 +111,8 @@ fn run(cli: Cli) -> anyhow::Result<()> {
         },
         Command::Context { context } => app.context(context),
         Command::Namespace { namespace, refresh } => app.namespace(namespace, refresh),
-        Command::Clean => app.clean(),
-        Command::Exit => app.exit(),
+        Command::Clean { force } => app.clean(force),
+        Command::Exit { force } => app.exit(force),
         Command::Init { shell, aliases } => app.init(shell, aliases),
         Command::RefreshNamespaces { context } => app.refresh_namespaces(&context),
     }

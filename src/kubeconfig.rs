@@ -68,59 +68,117 @@ impl KubeConfig {
 /// typically added by a tool such as `aws eks update-kubeconfig`) is carried over
 /// rather than silently dropped. The returned warnings describe what was kept.
 pub fn write_overlay(path: &Path, shadow: &NamedContext) -> Result<Vec<String>> {
-    let existing = read_overlay_mapping(path)?;
-    let mut warnings = Vec::new();
-
-    let previous_shadow = existing
-        .as_ref()
-        .and_then(|m| m.get("current-context"))
-        .and_then(Value::as_str)
-        .map(str::to_owned);
+    let foreign = match read_overlay_mapping(path)? {
+        Some(existing) => Foreign::split(existing),
+        None => Foreign::default(),
+    };
+    let warnings = foreign
+        .describe()
+        .into_iter()
+        .map(|entry| {
+            format!(
+                "kept {entry} found in the overlay; it was probably added by another tool and belongs in the main kubeconfig"
+            )
+        })
+        .collect();
 
     let mut contexts = vec![serde_norway::to_value(shadow)?];
-    let mut carried = Mapping::new();
-    if let Some(existing) = existing {
-        for (key, value) in existing {
-            match key.as_str() {
-                Some("apiVersion" | "kind" | "current-context" | "preferences") => {}
-                Some("contexts") => {
-                    for ctx in value.as_sequence().into_iter().flatten() {
-                        let name = ctx.get("name").and_then(Value::as_str);
-                        if name.is_some()
-                            && name != previous_shadow.as_deref()
-                            && name != Some(&shadow.name)
-                        {
-                            warnings.push(format!(
-                                "kept context '{}' found in the overlay; it was probably added by another tool and belongs in the main kubeconfig",
-                                name.unwrap_or_default()
-                            ));
-                            contexts.push(ctx.clone());
-                        }
-                    }
-                }
-                _ => {
-                    if !is_empty(&value) {
-                        warnings.push(format!(
-                            "kept '{}' entries found in the overlay; they were probably added by another tool and belong in the main kubeconfig",
-                            key.as_str().unwrap_or("?")
-                        ));
-                        carried.insert(key, value);
-                    }
-                }
-            }
-        }
-    }
+    contexts.extend(
+        foreign
+            .contexts
+            .into_iter()
+            .filter(|ctx| ctx.get("name").and_then(Value::as_str) != Some(&shadow.name)),
+    );
 
     let mut doc = Mapping::new();
     doc.insert("apiVersion".into(), "v1".into());
     doc.insert("kind".into(), "Config".into());
     doc.insert("current-context".into(), shadow.name.clone().into());
     doc.insert("contexts".into(), Value::Sequence(contexts));
-    doc.extend(carried);
+    doc.extend(foreign.other);
 
     let text = serde_norway::to_string(&Value::Mapping(doc))?;
     write_atomic(path, text.as_bytes(), 0o600)?;
     Ok(warnings)
+}
+
+/// Describes the entries in an overlay that kk didn't write, such as a cluster
+/// added by `aws eks update-kubeconfig`. Deleting an overlay with any of these
+/// would lose them. A missing overlay has none.
+pub fn foreign_entries(path: &Path) -> Result<Vec<String>> {
+    Ok(match read_overlay_mapping(path)? {
+        Some(mapping) => Foreign::split(mapping).describe(),
+        None => Vec::new(),
+    })
+}
+
+/// The parts of an overlay that kk didn't write.
+#[derive(Default)]
+struct Foreign {
+    /// Contexts other than the shadow context (the one `current-context` selects).
+    contexts: Vec<Value>,
+    /// Non-empty top-level keys other than the ones kk writes, e.g. `clusters`.
+    other: Mapping,
+}
+
+impl Foreign {
+    fn split(overlay: Mapping) -> Self {
+        let shadow = overlay
+            .get("current-context")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        let mut foreign = Foreign::default();
+        for (key, value) in overlay {
+            match key.as_str() {
+                Some("apiVersion" | "kind" | "current-context" | "preferences") => {}
+                Some("contexts") => {
+                    foreign.contexts.extend(
+                        value
+                            .as_sequence()
+                            .into_iter()
+                            .flatten()
+                            .filter(|ctx| {
+                                ctx.get("name").and_then(Value::as_str) != shadow.as_deref()
+                            })
+                            .cloned(),
+                    );
+                }
+                _ if is_empty(&value) => {}
+                _ => {
+                    foreign.other.insert(key, value);
+                }
+            }
+        }
+        foreign
+    }
+
+    /// Human-readable descriptions, e.g. `context 'new'` or `cluster 'new'`.
+    fn describe(&self) -> Vec<String> {
+        let mut entries: Vec<String> = self
+            .contexts
+            .iter()
+            .map(|ctx| format!("context '{}'", entry_name(ctx)))
+            .collect();
+        for (key, value) in &self.other {
+            let key = key.as_str().unwrap_or("?");
+            match (key, value.as_sequence()) {
+                ("clusters" | "users", Some(items)) => {
+                    let kind = key.trim_end_matches('s');
+                    entries.extend(
+                        items
+                            .iter()
+                            .map(|item| format!("{kind} '{}'", entry_name(item))),
+                    );
+                }
+                _ => entries.push(format!("'{key}' entries")),
+            }
+        }
+        entries
+    }
+}
+
+fn entry_name(entry: &Value) -> &str {
+    entry.get("name").and_then(Value::as_str).unwrap_or("?")
 }
 
 /// Returns the context an overlay currently selects, if the overlay exists and is valid.
@@ -180,6 +238,12 @@ mod tests {
 
         let current = read_overlay_current(&path).unwrap().unwrap();
         assert_eq!(current, shadow("prod", "team-a"));
+        assert!(foreign_entries(&path).unwrap().is_empty());
+        assert!(
+            foreign_entries(&dir.path().join("missing"))
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
@@ -197,6 +261,11 @@ mod tests {
         text.push_str("clusters:\n- name: new\n  cluster:\n    server: https://new\n");
         fs::write(&path, text).unwrap();
 
+        assert_eq!(
+            foreign_entries(&path).unwrap(),
+            ["context 'new'", "cluster 'new'"]
+        );
+
         let warnings = write_overlay(&path, &shadow("staging", "team-b")).unwrap();
         assert_eq!(warnings.len(), 2, "{warnings:?}");
 
@@ -205,5 +274,10 @@ mod tests {
         assert_eq!(names, ["staging", "new"]);
         assert_eq!(config.current_context.as_deref(), Some("staging"));
         assert!(fs::read_to_string(&path).unwrap().contains("https://new"));
+        // Still foreign after the switch, so the overlay must not be deleted.
+        assert_eq!(
+            foreign_entries(&path).unwrap(),
+            ["context 'new'", "cluster 'new'"]
+        );
     }
 }

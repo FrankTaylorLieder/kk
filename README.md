@@ -42,9 +42,20 @@ Requirements:
   it, `kk` uses a simple built-in picker.
 - **bash or zsh.**
 
-Build and install:
+Install straight from GitHub:
 
 ```sh
+cargo install --git https://github.com/FrankTaylorLieder/kk
+```
+
+This puts `kk` in `~/.cargo/bin`, which needs to be on your `PATH`. Run the same
+command again to upgrade.
+
+Or build from a local clone:
+
+```sh
+git clone https://github.com/FrankTaylorLieder/kk
+cd kk
 cargo install --path .
 ```
 
@@ -75,8 +86,8 @@ kk profile name NAME          # name the current profile
 kk profile list               # list profiles
 kk profile current               # print the current profile's name (for prompts)
 kk profile rm NAME            # remove a profile
-kk exit                       # this shell goes back to the plain ~/.kube/config
-kk clean                      # remove overlays left by shells that have exited
+kk exit [--force]             # this shell goes back to the plain ~/.kube/config
+kk clean [--force]            # remove overlays left by shells that have exited
 ```
 
 Short forms: `kk ctx`, `kk ns`, `kk p` and `kk profile ls`.
@@ -241,8 +252,14 @@ Variables `kk` sets in your shell:
   KUBECONFIG=~/.kube/config gcloud container clusters get-credentials my-cluster
   ```
 
-  If an entry does land in an overlay, `kk` keeps it on the next switch and warns
-  you, rather than dropping it.
+  If an entry does land in an overlay, `kk` protects it:
+  - **On a switch:** the entry is kept, with a warning, rather than dropped.
+  - **`kk exit`:** refuses to delete the overlay and names the entries.
+  - **`kk clean`:** keeps that shell's overlay and names the entries.
+
+  Move the entries into `~/.kube/config` first. You can see them with
+  `kubectl --kubeconfig <overlay> config view --raw`. Or pass `--force` to discard
+  them.
 - **Changing the namespace with kubectl directly**
   (`kubectl config set-context --current --namespace=…`) works and only affects
   the current shell. `kk profile current` reflects it immediately, but `KK_PROFILE`
