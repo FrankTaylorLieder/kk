@@ -244,11 +244,11 @@ alias kns='kk namespace'
     With no context at all, it prints nothing and exits 1.
 
   - `--short` abbreviates long derived names for prompts, e.g.
-    `public-local-se-sto-management/evroc-operator-system` → `p-l-s-s-m/e-o-s`.
+    `public-local-se-sto-management/evroc-operator-system` → `pub-loc-se-sto-man/evr-ope-sys`.
     - Names are split into segments at `-`, `_`, `.`, `:` and `/`.
     - Left to right, each segment is cut to the shortest prefix that keeps the name
       unique among its peers (powerlevel10k's `truncate_to_unique`, applied to name
-      segments).
+      segments). Segments are never cut below 3 characters, for readability.
     - The peers of the context are the main config's contexts. The peers of the
       namespace are the namespaces that catalogue profiles use with that context;
       no cluster query is made.

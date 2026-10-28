@@ -286,7 +286,7 @@ abbreviates both parts of an unnamed profile:
 $ kk profile current
 public-local-se-sto-management/evroc-operator-system
 $ kk profile current --short
-p-l-s-s-m/e-o-s
+pub-loc-se-sto-man/evr-ope-sys
 ```
 
 How the abbreviation works:
@@ -294,7 +294,8 @@ How the abbreviation works:
 - **Segments:** names are split at `-`, `_`, `.`, `:` and `/`.
 - **Shortening:** working left to right, each segment is cut to the shortest
   prefix that still keeps the name unique, in the style of powerlevel10k's
-  `truncate_to_unique`.
+  `truncate_to_unique`. Segments are never cut below 3 characters, so `se` and
+  `az1` stay whole.
 - **What it's unique among:**
   - the context, among the contexts in your kubeconfig
   - the namespace, among the namespaces your profiles use with that context. The
