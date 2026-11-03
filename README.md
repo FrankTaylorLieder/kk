@@ -345,6 +345,15 @@ Variables `kk` sets in your shell:
 | `KK_PROFILE` | Current profile name, as of the last `kk` switch |
 | *(profile `env`)* | Anything listed in the profile's `env` |
 
+### Files
+
+| File | Location |
+|---|---|
+| Profile catalogue | `$KK_CONFIG_DIR/profiles.yaml`. Default: `$XDG_CONFIG_HOME/kk` (usually `~/.config/kk`) on Linux, `~/Library/Application Support/kk` on macOS |
+| Per-shell overlay and state | `overlay.<pid>` and `state.<pid>.json` in `$KK_RUNTIME_DIR`. Default: `$XDG_RUNTIME_DIR/kk`, or `$TMPDIR/kk-<uid>` where that isn't set (e.g. macOS) |
+| Namespace cache | `$KK_CACHE_DIR/namespaces/<context>.json`. Default: `$XDG_CACHE_HOME/kk` (usually `~/.cache/kk`) on Linux, `~/Library/Caches/kk` on macOS |
+| Main kubeconfig | `$KK_MAIN_KUBECONFIG`. Default: `~/.kube/config`, with backup `config.kk-backup` beside it |
+
 ## Caveats
 
 - **YAML comments in `~/.kube/config` are lost** when `kk` imports entries into
