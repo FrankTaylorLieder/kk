@@ -88,6 +88,7 @@ kk namespace [NAMESPACE]      # switch namespace within the current context
 kk profile [NAME]             # switch to a saved profile (picker if omitted)
 kk profile -                  # back to this shell's previous profile
 kk profile name NAME          # name the current profile
+kk profile unname [PROFILE]   # remove a profile's name (default: the current one)
 kk profile list               # list profiles
 kk profile current [--short]     # print the current profile's name (for prompts)
 kk profile rm NAME            # remove a profile
@@ -123,8 +124,12 @@ keeps its own setting.
   `kk profile prod/team-a`.
 - **Naming the current one:** `kk profile name prod-a`. After that, both `prod-a`
   and `prod/team-a` select it.
+- **Removing a name:** `kk profile unname` turns the current profile back into an
+  unnamed one; `kk profile unname prod-a` does the same for any profile. Its use
+  history is kept, but like other unnamed profiles it fades out once it stops being
+  used.
 - **Name rules:** names can't contain `/` or whitespace, can't start with `-`, and
-  can't be `name`, `list`, `ls`, `rm` or `current`.
+  can't be `name`, `unname`, `list`, `ls`, `rm` or `current`.
 
 `kk profile list` and the picker show the current shell's profile with a `*`. A
 profile whose context no longer exists in `~/.kube/config` is marked `[stale]`.
@@ -182,7 +187,7 @@ TAB completes values as well as subcommands and flags:
 | Command | Completes |
 |---|---|
 | `kk context <TAB>` | contexts from `~/.kube/config`, most used first |
-| `kk profile <TAB>`, `kk profile rm <TAB>` | profile names, and `<context>/<namespace>` for unnamed ones, in picker order. Named profiles show their `<context>/<namespace>` as a description in zsh |
+| `kk profile <TAB>`, `kk profile rm <TAB>`, `kk profile unname <TAB>` | profile names, and `<context>/<namespace>` for unnamed ones, in picker order. Named profiles show their `<context>/<namespace>` as a description in zsh |
 | `kk namespace <TAB>` | namespaces already used with the current context, then the cached namespace list |
 
 - **Speed:** completion never waits on `kubectl`. If a context has no cached

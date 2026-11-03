@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use std::fs::{self, File};
 use std::path::PathBuf;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 
@@ -18,7 +18,7 @@ pub const AGING_THRESHOLD: u64 = 1000;
 const AGING_FACTOR: f64 = 0.9;
 
 /// Words that can't be profile names because they are `kk profile` subcommands.
-const RESERVED_NAMES: &[&str] = &["name", "list", "ls", "rm", "current"];
+const RESERVED_NAMES: &[&str] = &["name", "unname", "list", "ls", "rm", "current"];
 
 /// What identifies a profile: at most one catalogue entry exists per key.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -195,6 +195,18 @@ impl Catalogue {
         let profile = self.get_or_insert(key);
         profile.name = Some(name.to_owned());
         Ok(profile.clone())
+    }
+
+    /// Removes a profile's name, leaving it as an unnamed `<context>/<namespace>` profile.
+    /// Returns the name it had.
+    pub fn clear_name(&mut self, key: &Key) -> Result<String> {
+        let Some(profile) = self.profiles.iter_mut().find(|p| p.is_key(key)) else {
+            bail!("no profile {}", key.derived_name());
+        };
+        profile
+            .name
+            .take()
+            .ok_or_else(|| anyhow!("profile {} has no name", key.derived_name()))
     }
 
     pub fn remove(&mut self, name: &str) -> Result<Profile> {
@@ -430,6 +442,18 @@ mod tests {
         assert!(c.set_name(&key("c", "b"), "mine").is_err());
         // Renaming the same profile is fine.
         c.set_name(&key("c", "a"), "mine").unwrap();
+    }
+
+    #[test]
+    fn clear_name_frees_the_name() {
+        let mut c = Catalogue::default();
+        c.set_name(&key("c", "a"), "mine").unwrap();
+        assert_eq!(c.clear_name(&key("c", "a")).unwrap(), "mine");
+        assert!(c.resolve("mine").is_none());
+        assert!(c.resolve("c/a").is_some());
+        assert!(c.clear_name(&key("c", "a")).is_err());
+        assert!(c.clear_name(&key("c", "b")).is_err());
+        c.set_name(&key("c", "b"), "mine").unwrap();
     }
 
     #[test]

@@ -95,6 +95,12 @@ struct ProfileArgs {
 enum ProfileAction {
     /// Name the current shell's profile
     Name { name: String },
+    /// Remove a profile's name, leaving it as <context>/<namespace>
+    Unname {
+        /// Profile to unname (default: the current shell's profile)
+        #[arg(add = ArgValueCandidates::new(completion::profiles))]
+        name: Option<String>,
+    },
     /// List profiles, most relevant first
     #[command(visible_alias = "ls")]
     List,
@@ -133,6 +139,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
     match cli.command {
         Command::Profile(args) => match args.action {
             Some(ProfileAction::Name { name }) => app.profile_name(&name),
+            Some(ProfileAction::Unname { name }) => app.profile_unname(name.as_deref()),
             Some(ProfileAction::List) => app.profile_list(),
             Some(ProfileAction::Rm { name }) => app.profile_rm(&name),
             Some(ProfileAction::Current { short }) => app.profile_current(short),

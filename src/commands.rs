@@ -94,6 +94,32 @@ impl App {
         Ok(())
     }
 
+    pub fn profile_unname(&self, target: Option<&str>) -> Result<()> {
+        let shell = Shell::detect()?;
+        let main = self.main_config()?;
+        let key = match target {
+            Some(name) => self
+                .store
+                .load()?
+                .resolve(name)
+                .map(Profile::key)
+                .ok_or_else(|| anyhow!("no profile named '{name}' (see `kk profile list`)"))?,
+            None => self
+                .current_key(shell.as_ref().map(|s| s.pid), &main)?
+                .ok_or_else(|| anyhow!("no current profile to unname"))?,
+        };
+        let name = self.store.update(|c| c.clear_name(&key))?;
+        eprintln!("kk: removed name '{name}' from {}", key.derived_name());
+
+        if let Some(mut shell) = shell {
+            if self.overlay_key(shell.pid, &main)?.as_ref() == Some(&key) {
+                shell.export("KK_PROFILE", &key.derived_name());
+            }
+            shell.finish()?;
+        }
+        Ok(())
+    }
+
     pub fn profile_list(&self) -> Result<()> {
         let catalogue = self.store.load()?;
         if catalogue.profiles.is_empty() {
