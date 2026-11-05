@@ -183,12 +183,21 @@ impl App {
     /// With `short`, an unnamed profile's context and namespace are abbreviated to
     /// stay unique among the main config's contexts and the namespaces profiles use
     /// with that context. Names given with `kk profile name` are shown as they are.
+    /// When kk isn't active in this shell, it shows what kubectl would use, in
+    /// brackets.
     pub fn profile_current(&self, short: bool) -> Result<()> {
         let main = self.main_config()?;
         // Find the overlay from KUBECONFIG, so this works when run as `command kk`
         // from a prompt, without the shell function.
-        let Some(key) = self.current_key(self.active_overlay_pid(), &main)? else {
-            return Err(Silent.into());
+        let pid = self.active_overlay_pid();
+        let overlay_key = match pid {
+            Some(pid) => self.overlay_key(pid, &main)?,
+            None => None,
+        };
+        let active = overlay_key.is_some();
+        let key = match overlay_key {
+            Some(key) => key,
+            None => self.kubectl_key(&main)?.ok_or(Silent)?,
         };
         let catalogue = self.store.load()?;
         let name = match catalogue.profile(&key) {
@@ -211,8 +220,12 @@ impl App {
             }
             _ => key.derived_name(),
         };
+        if !active {
+            println!("({name})");
+            return Ok(());
+        }
         // Flag a shell whose overlay another tool changed and kk hasn't picked up yet.
-        let marker = match self.active_overlay_pid() {
+        let marker = match pid {
             Some(pid) => {
                 let shadow = ShellState::load(&self.paths.state_file(pid))?.shadow;
                 if has_outside_changes(&self.paths.overlay_file(pid), shadow.as_deref())? {
@@ -641,6 +654,19 @@ impl App {
     }
 
     /// The PID of the overlay that `KUBECONFIG` currently starts with, if any.
+    /// The context and namespace kubectl would use without kk: `KUBECONFIG` merged,
+    /// or the main kubeconfig if it isn't set.
+    fn kubectl_key(&self, main: &KubeConfig) -> Result<Option<Key>> {
+        let files: Vec<_> = match std::env::var_os("KUBECONFIG") {
+            Some(v) if !v.is_empty() => std::env::split_paths(&v)
+                .filter(|p| !p.as_os_str().is_empty())
+                .collect(),
+            _ => vec![self.paths.main_kubeconfig.clone()],
+        };
+        let config = KubeConfig::load_merged(&files)?;
+        Ok(config.current().map(|ctx| key_for(ctx, main)))
+    }
+
     fn active_overlay_pid(&self) -> Option<u32> {
         let kubeconfig = std::env::var_os("KUBECONFIG")?;
         let first = std::env::split_paths(&kubeconfig).next()?;

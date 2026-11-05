@@ -273,7 +273,9 @@ kk import --overwrite    # import, replacing conflicting entries without asking
 `kk profile current` prints the current shell's profile: its name if you've given it
 one, otherwise `<context>/<namespace>`.
 
-- **Without kk's overlay:** it shows the main kubeconfig's current context.
+- **Without kk's overlay:** it shows the context and namespace kubectl would use,
+  in brackets, e.g. `(prod/team-a)`. It merges the files in `KUBECONFIG` the way
+  kubectl does, or reads `~/.kube/config` if that isn't set.
 - **No context at all:** it prints nothing and exits with status 1.
 
 It reads the shell's overlay directly, so it stays accurate even after you change

@@ -4,7 +4,7 @@
 //! it, so it parses just those and leaves merging to kubectl and friends.
 
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -48,6 +48,24 @@ impl KubeConfig {
             return Ok(Self::default());
         }
         serde_norway::from_str(&text).with_context(|| format!("parsing {}", path.display()))
+    }
+
+    /// Loads several files merged the way kubectl merges `KUBECONFIG`: the first
+    /// `current-context` set wins, as does the first context with a given name.
+    pub fn load_merged(paths: &[PathBuf]) -> Result<Self> {
+        let mut merged = Self::default();
+        for path in paths {
+            let config = Self::load(path)?;
+            if merged.current_context.is_none() {
+                merged.current_context = config.current_context.filter(|c| !c.is_empty());
+            }
+            for ctx in config.contexts {
+                if merged.context(&ctx.name).is_none() {
+                    merged.contexts.push(ctx);
+                }
+            }
+        }
+        Ok(merged)
     }
 
     pub fn context(&self, name: &str) -> Option<&NamedContext> {
@@ -243,6 +261,27 @@ mod tests {
                 namespace: Some(ns.into()),
             },
         }
+    }
+
+    #[test]
+    fn load_merged_takes_first_definitions() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a");
+        let b = dir.path().join("b");
+        fs::write(
+            &a,
+            "contexts:\n- name: prod\n  context: {cluster: c, user: u, namespace: team-a}\n",
+        )
+        .unwrap();
+        fs::write(
+            &b,
+            "current-context: prod\ncontexts:\n- name: prod\n  context: {cluster: c, user: u, namespace: team-b}\n",
+        )
+        .unwrap();
+        let merged = KubeConfig::load_merged(&[dir.path().join("missing"), a, b]).unwrap();
+        let current = merged.current().unwrap();
+        assert_eq!(current.name, "prod");
+        assert_eq!(current.context.namespace.as_deref(), Some("team-a"));
     }
 
     #[test]
